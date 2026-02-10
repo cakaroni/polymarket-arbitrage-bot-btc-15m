@@ -140,6 +140,10 @@ This bot is for **educational and research purposes**. Trading prediction market
 
 For questions, support, or collaboration around this Polymarket trading bot, reach out via Telegram.
 
+## Contact
+
+[![Cakaroni](https://t.me/cakaroni)
+
 ---
 
 ## Keywords (for search)

@@ -35,6 +35,8 @@ pub struct StrategyConfig {
     pub signal: SignalConfig,
     #[serde(default = "default_sell_opposite_above")]
     pub sell_opposite_above: f64,
+    #[serde(default = "default_sell_opposite_time_remaining")]
+    pub sell_opposite_time_remaining: u64,
     #[serde(default = "default_market_closure_check_interval_seconds")]
     pub market_closure_check_interval_seconds: u64,
 }
@@ -53,6 +55,10 @@ pub struct SignalConfig {
     pub clear_remaining_mins: u64,
     #[serde(default = "default_danger_price")]
     pub danger_price: f64,
+    #[serde(default = "default_danger_time_passed")]
+    pub danger_time_passed: u64,
+    #[serde(default = "default_one_side_buy_risk_management")]
+    pub one_side_buy_risk_management: String,
     #[serde(default = "default_true")]
     pub mid_market_enabled: bool,
 }
@@ -63,7 +69,10 @@ fn default_stable_max() -> f64 { 0.65 }
 fn default_clear_threshold() -> f64 { 0.99 }
 fn default_clear_remaining_mins() -> u64 { 15 }
 fn default_danger_price() -> f64 { 0.15 }
+fn default_danger_time_passed() -> u64 { 30 }
+fn default_one_side_buy_risk_management() -> String { "price".to_string() }
 fn default_sell_opposite_above() -> f64 { 0.95 }
+fn default_sell_opposite_time_remaining() -> u64 { 15 }
 fn default_market_closure_check_interval_seconds() -> u64 { 120 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +109,7 @@ impl Default for Config {
                 simulation_mode: false,
                 signal: SignalConfig::default(),
                 sell_opposite_above: 0.95,
+                sell_opposite_time_remaining: 15,
                 market_closure_check_interval_seconds: 120,
             },
         }

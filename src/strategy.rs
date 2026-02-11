@@ -156,6 +156,7 @@ impl PreLimitStrategy {
                         risk_sold: false,
                         order_placed_at: current_time_et,
                         market_period_start: next_period_start,
+                        one_side_matched_at: None,
                     };
                     states.insert(asset.to_string(), new_state);
                     
@@ -178,6 +179,13 @@ impl PreLimitStrategy {
                         .and_then(|p| p.to_string().parse::<f64>().ok()).unwrap_or(0.0),
                 );
 
+                // Calculate time remaining in the current market period
+                let current_time_et = Self::get_current_time_et();
+                let market_end_time = s.market_period_start + 3600; // 1 hour market
+                let time_remaining_seconds = market_end_time - current_time_et;
+                let time_remaining_mins = time_remaining_seconds / 60;
+                let required_time_remaining_mins = self.config.strategy.sell_opposite_time_remaining as i64;
+
                 let sell_opposite = if up_price >= threshold {
                     Some(("Up", "Down", &s.down_token_id, s.down_order_price))
                 } else if down_price >= threshold {
@@ -186,82 +194,114 @@ impl PreLimitStrategy {
                     None
                 };
 
+                // Only sell if BOTH conditions are met: price threshold AND time remaining is low enough
                 if let Some((winner, loser, token_to_sell, purchase_price)) = sell_opposite {
-                    log::info!("{}: Both matched but {} price ${:.2} >= {:.2} — selling {} to reduce loss", 
-                        asset, winner, if winner == "Up" { up_price } else { down_price }, threshold, loser);
-                    let sell_price_result = self.api.get_price(token_to_sell, "SELL").await;
-                    let sell_price = sell_price_result.ok()
-                        .and_then(|p| p.to_string().parse::<f64>().ok()).unwrap_or(0.0);
-                    if self.config.strategy.simulation_mode {
-                        let loss = (purchase_price - sell_price) * self.config.strategy.shares;
-                        let mut total = self.total_profit.lock().await;
-                        *total -= loss;
-                        let current_total = *total;
-                        drop(total);
-                        log::info!("🎮 SIMULATION: Would sell {} {} shares at ${:.4} (purchased at ${:.2})", 
-                            self.config.strategy.shares, loser, sell_price, purchase_price);
-                        log::info!("   Holding {} to expiry (pays $1). Loss on {}: ${:.2} | Total Profit: ${:.2}", 
-                            winner, loser, loss, current_total);
-                    } else {
-                        if let Err(e) = self.api.place_market_order(&token_to_sell, self.config.strategy.shares, "SELL", None).await {
-                            log::error!("Failed to sell {} token for {}: {}", loser, asset, e);
-                        } else {
+                    if time_remaining_mins <= required_time_remaining_mins {
+                        log::info!("{}: Both filled, {} price ${:.2} >= {:.2} AND {}min remaining <= {}min — selling {} to reduce loss", 
+                            asset, winner, if winner == "Up" { up_price } else { down_price }, threshold, 
+                            time_remaining_mins, required_time_remaining_mins, loser);
+                        let sell_price_result = self.api.get_price(token_to_sell, "SELL").await;
+                        let sell_price = sell_price_result.ok()
+                            .and_then(|p| p.to_string().parse::<f64>().ok()).unwrap_or(0.0);
+                        if self.config.strategy.simulation_mode {
                             let loss = (purchase_price - sell_price) * self.config.strategy.shares;
                             let mut total = self.total_profit.lock().await;
                             *total -= loss;
                             let current_total = *total;
                             drop(total);
-                            log::info!("   Sold {} {} shares at ${:.2}. Holding {} to expiry (pays $1). Loss: ${:.2} | Total Profit: ${:.2}", 
-                                self.config.strategy.shares, loser, sell_price, winner, loss, current_total);
+                            log::info!("🎮 SIMULATION: Would sell {} {} shares at ${:.4} (purchased at ${:.2})", 
+                                self.config.strategy.shares, loser, sell_price, purchase_price);
+                            log::info!("   Holding {} to expiry (pays $1). Loss on {}: ${:.2} | Total Profit: ${:.2}", 
+                                winner, loser, loss, current_total);
+                        } else {
+                            if let Err(e) = self.api.place_market_order(&token_to_sell, self.config.strategy.shares, "SELL", None).await {
+                                log::error!("Failed to sell {} token for {}: {}", loser, asset, e);
+                            } else {
+                                let loss = (purchase_price - sell_price) * self.config.strategy.shares;
+                                let mut total = self.total_profit.lock().await;
+                                *total -= loss;
+                                let current_total = *total;
+                                drop(total);
+                                log::info!("   Sold {} {} shares at ${:.2}. Holding {} to expiry (pays $1). Loss: ${:.2} | Total Profit: ${:.2}", 
+                                    self.config.strategy.shares, loser, sell_price, winner, loss, current_total);
+                            }
                         }
-                    }
-                    s.merged = true;
-                } else {
-                    let profit_per_market = self.config.strategy.shares * 0.10;
-                    log::info!("Both orders matched for {}. Merging positions...", asset);
-                    if self.config.strategy.simulation_mode {
-                        log::info!("🎮 SIMULATION: Would merge {} shares for condition {}", 
-                            self.config.strategy.shares, s.condition_id);
-                        let mut total = self.total_profit.lock().await;
-                        *total += profit_per_market;
-                        let current_total = *total;
-                        drop(total);
-                        log::info!("   💰 SIMULATION: Profit locked in: ${:.2} ({} shares × $0.10) | Total Profit: ${:.2}", 
-                            profit_per_market, self.config.strategy.shares, current_total);
                         s.merged = true;
+                        // Register for redemption (production only): holding winner, check_market_closure will redeem when market resolves
+                        if !self.config.strategy.simulation_mode {
+                            let trade = Self::cycle_trade_holding_winner(&s, winner, self.config.strategy.shares);
+                            let mut t = self.trades.lock().await;
+                            t.insert(s.condition_id.clone(), trade);
+                            log::info!("   Registered position for redemption when market resolves (condition {})", &s.condition_id[..s.condition_id.len().min(20)]);
+                        }
                     } else {
-                        log::info!("   Both matched for {}. TODO: Add redemption logic here.", asset);
-                        let mut total = self.total_profit.lock().await;
-                        *total += profit_per_market;
-                        let current_total = *total;
-                        drop(total);
-                        log::info!("   💰 Profit locked in: ${:.2} ({} shares × $0.10) | Total Profit: ${:.2}", 
-                            profit_per_market, self.config.strategy.shares, current_total);
-                        s.merged = true;
+                        log::debug!("{}: {} price ${:.2} >= {:.2}, but {}min remaining > {}min threshold — holding both positions", 
+                            asset, winner, if winner == "Up" { up_price } else { down_price }, threshold,
+                            time_remaining_mins, required_time_remaining_mins);
                     }
                 }
+                // When both filled but neither side >= sell_opposite_above: do nothing.
+                // Hold both until one side hits threshold (re-check next tick) or expiry (redeem).
             }
 
             let current_time_et = Self::get_current_time_et();
             let time_since_market_start = current_time_et - s.market_period_start;
             let sell_after_seconds = (self.config.strategy.sell_unmatched_after_mins * 60) as i64;
 
-            // Check danger signal: if matched token price collapsed, sell early
-            let should_sell_early = if s.up_matched && !s.down_matched {
-                self.api.get_price(&s.up_token_id, "SELL").await
-                    .ok()
-                    .and_then(|p| p.to_string().parse::<f64>().ok())
-                    .map(|p| signals::is_danger_signal(&self.config.strategy.signal, p))
-                    .unwrap_or(false)
-            } else if s.down_matched && !s.up_matched {
-                self.api.get_price(&s.down_token_id, "SELL").await
-                    .ok()
-                    .and_then(|p| p.to_string().parse::<f64>().ok())
-                    .map(|p| signals::is_danger_signal(&self.config.strategy.signal, p))
-                    .unwrap_or(false)
+            // Track when we first had only one side matched (for sell_after_danger_time_passed)
+            let only_one_matched = (s.up_matched && !s.down_matched) || (s.down_matched && !s.up_matched);
+            if only_one_matched && s.one_side_matched_at.is_none() {
+                s.one_side_matched_at = Some(current_time_et);
+            }
+
+            // One-side risk management: optional early sell (in addition to sell_unmatched_after_mins timeout)
+            // "price" = sell when matched token <= danger_price; "time" = sell after danger_time_passed mins
+            let mode = match self.config.strategy.signal.one_side_buy_risk_management.to_lowercase().as_str() {
+                "price" | "sell_at_danger_price" => "price",
+                "time" | "sell_after_danger_time_passed" => "time",
+                _ => "none",
+            };
+            let mut should_sell_early = if !only_one_matched {
+                false
+            } else if mode == "price" {
+                if s.up_matched && !s.down_matched {
+                    self.api.get_price(&s.up_token_id, "SELL").await
+                        .ok()
+                        .and_then(|p| p.to_string().parse::<f64>().ok())
+                        .map(|p| signals::is_danger_signal(&self.config.strategy.signal, p))
+                        .unwrap_or(false)
+                } else {
+                    self.api.get_price(&s.down_token_id, "SELL").await
+                        .ok()
+                        .and_then(|p| p.to_string().parse::<f64>().ok())
+                        .map(|p| signals::is_danger_signal(&self.config.strategy.signal, p))
+                        .unwrap_or(false)
+                }
+            } else if mode == "sell_after_danger_time_passed" {
+                let danger_mins = self.config.strategy.signal.danger_time_passed as i64;
+                s.one_side_matched_at.map_or(false, |t| current_time_et - t >= danger_mins * 60)
             } else {
                 false
             };
+
+            // Production only: when danger would trigger, verify both orders via API first.
+            // If both filled, don't sell — update state and let "both matched" logic handle next tick.
+            if !self.config.strategy.simulation_mode && should_sell_early {
+                if let (Some(up_id), Some(down_id)) = (&s.up_order_id, &s.down_order_id) {
+                    match self.api.are_both_orders_filled(up_id, down_id).await {
+                        Ok((true, true)) => {
+                            log::info!("{}: Danger signal but both orders filled (verified via API) — skipping sell", asset);
+                            s.up_matched = true;
+                            s.down_matched = true;
+                            should_sell_early = false;
+                        }
+                        Ok(_) => { /* one or both not filled, proceed with sell */ }
+                        Err(e) => {
+                            log::warn!("{}: Failed to verify order status: {} — proceeding with danger sell", asset, e);
+                        }
+                    }
+                }
+            }
 
             let should_sell = !s.merged && !s.risk_sold && (
                 should_sell_early ||
@@ -269,9 +309,17 @@ impl PreLimitStrategy {
             );
 
             if should_sell {
+                let reason = if should_sell_early {
+                    if mode == "time" {
+                        format!("Danger time passed ({}min since match)", self.config.strategy.signal.danger_time_passed)
+                    } else {
+                        "Danger signal (price collapsed)".to_string()
+                    }
+                } else {
+                    "Timeout reached".to_string()
+                };
                 if s.up_matched && !s.down_matched {
-                    let reason = if should_sell_early { "Danger signal (price collapsed)" } else { "Timeout reached" };
-                    log::warn!("{}: {} — only Up token matched. Selling Up token and canceling Down order", asset, reason);
+                    log::warn!("{}: {} — only Up token matched. Selling Up token and canceling Down order", asset, reason.as_str());
                     
                     let sell_price_result = self.api.get_price(&s.up_token_id, "SELL").await;
                     let purchase_price = s.up_order_price;
@@ -328,8 +376,7 @@ impl PreLimitStrategy {
                     s.risk_sold = true;
                     s.merged = true;
                 } else if s.down_matched && !s.up_matched {
-                    let reason = if should_sell_early { "Danger signal (price collapsed)" } else { "Timeout reached" };
-                    log::warn!("{}: {} — only Down token matched. Selling Down token and canceling Up order", asset, reason);
+                    log::warn!("{}: {} — only Down token matched. Selling Down token and canceling Up order", asset, reason.as_str());
                     
                     // Get current sell price for Down token
                     let sell_price_result = self.api.get_price(&s.down_token_id, "SELL").await;
@@ -390,6 +437,13 @@ impl PreLimitStrategy {
 
             let current_time_et = Self::get_current_time_et();
             if current_time_et > s.expiry {
+                // Register for redemption (production only) if we held both until expiry (sold opposite already registered)
+                if !self.config.strategy.simulation_mode && s.up_matched && s.down_matched && !s.risk_sold && !s.merged {
+                    let trade = Self::cycle_trade_holding_both(&s, self.config.strategy.shares);
+                    let mut t = self.trades.lock().await;
+                    t.insert(s.condition_id.clone(), trade);
+                    log::info!("   Registered position for redemption when market resolves (condition {})", &s.condition_id[..s.condition_id.len().min(20)]);
+                }
                 log::info!("Market expired for {}. Clearing state.", asset);
                 states.remove(asset);
             } else {
@@ -398,6 +452,13 @@ impl PreLimitStrategy {
         } else if time_until_next > (self.config.strategy.place_order_before_mins * 60) as i64
             && self.config.strategy.signal.mid_market_enabled
         {
+            // Don't place mid-market orders if too little time remains — we'd hit timeout and sell at a loss.
+            let time_remaining_in_current_market = (current_period_et + 3600) - current_time_et;
+            let min_remaining_to_place = (self.config.strategy.sell_unmatched_after_mins * 60) as i64;
+            if time_remaining_in_current_market < min_remaining_to_place {
+                log::debug!("{} | Skipping mid-market orders: only {}s left (need {}s to avoid immediate timeout)",
+                    asset, time_remaining_in_current_market, min_remaining_to_place);
+            } else {
             let signal = self.get_place_signal(asset, current_period_et).await;
             if signal == MarketSignal::Good {
                 if let Some(current_market) = self.discover_next_market(asset, current_period_et).await? {
@@ -430,10 +491,12 @@ impl PreLimitStrategy {
                         risk_sold: false,
                         order_placed_at: current_time_et,
                         market_period_start: current_period_et,
+                        one_side_matched_at: None,
                     };
                     states.insert(asset.to_string(), new_state);
                     return Ok(());
                 }
+            }
             }
         }
 
@@ -619,6 +682,39 @@ impl PreLimitStrategy {
         rounded.clamp(0.01, 0.99)
     }
 
+    fn cycle_trade_holding_winner(s: &PreLimitOrderState, winner: &str, shares: f64) -> CycleTrade {
+        let (up_shares, down_shares, up_avg, down_avg) = if winner == "Up" {
+            (shares, 0.0, s.up_order_price, 0.0)
+        } else {
+            (0.0, shares, 0.0, s.down_order_price)
+        };
+        CycleTrade {
+            condition_id: s.condition_id.clone(),
+            period_timestamp: s.market_period_start as u64,
+            market_duration_secs: 3600,
+            up_token_id: Some(s.up_token_id.clone()),
+            down_token_id: Some(s.down_token_id.clone()),
+            up_shares,
+            down_shares,
+            up_avg_price: up_avg,
+            down_avg_price: down_avg,
+        }
+    }
+
+    fn cycle_trade_holding_both(s: &PreLimitOrderState, shares: f64) -> CycleTrade {
+        CycleTrade {
+            condition_id: s.condition_id.clone(),
+            period_timestamp: s.market_period_start as u64,
+            market_duration_secs: 3600,
+            up_token_id: Some(s.up_token_id.clone()),
+            down_token_id: Some(s.down_token_id.clone()),
+            up_shares: shares,
+            down_shares: shares,
+            up_avg_price: s.up_order_price,
+            down_avg_price: s.down_order_price,
+        }
+    }
+
     async fn place_limit_order(&self, token_id: &str, side: &str, price: f64) -> Result<OrderResponse> {
         let price = Self::round_price(price);
         if self.config.strategy.simulation_mode {
@@ -648,18 +744,39 @@ impl PreLimitStrategy {
         let current_time_et = Self::get_current_time_et();
         
         // IMPORTANT: Only check matches if the market where orders were placed has actually started
-        // Market starts at market_period_start. Orders can't match before the market is active.
-        // This check applies to BOTH simulation and production modes.
         if current_time_et < state.market_period_start {
-            // Market hasn't started yet, can't match orders - return early
             log::debug!("Market {} for {} hasn't started yet (current: {}, start: {})", 
                 state.market_period_start, state.asset, current_time_et, state.market_period_start);
             return Ok(());
         }
 
+        // Production: verify fill status via CLOB API (ground truth). Simulation: infer from price.
+        if !self.config.strategy.simulation_mode {
+            if let (Some(up_id), Some(down_id)) = (&state.up_order_id, &state.down_order_id) {
+                // Skip API for simulation-style fake order IDs
+                if !up_id.starts_with("SIM-") && !down_id.starts_with("SIM-") {
+                    match self.api.are_both_orders_filled(up_id, down_id).await {
+                        Ok((up_filled, down_filled)) => {
+                            if up_filled && !state.up_matched {
+                                log::info!("✅ Up order filled for {} (verified via API)", state.asset);
+                                state.up_matched = true;
+                            }
+                            if down_filled && !state.down_matched {
+                                log::info!("✅ Down order filled for {} (verified via API)", state.asset);
+                                state.down_matched = true;
+                            }
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            log::debug!("{}: API fill check failed ({}), falling back to price inference", state.asset, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Simulation or API fallback: infer matched from current price vs limit
         let up_price_result = self.api.get_price(&state.up_token_id, "SELL").await;
-        
-        // Get Down token price via REST API
         let down_price_result = self.api.get_price(&state.down_token_id, "SELL").await;
         
         if let Ok(up_price) = up_price_result {
@@ -681,10 +798,8 @@ impl PreLimitStrategy {
             let down_price_f64: f64 = down_price.to_string().parse().unwrap_or(0.0);
             let limit = state.down_order_price;
             let price_matches = down_price_f64 <= limit || (down_price_f64 - limit).abs() < 0.001;
-            
-            log::debug!("Checking Down order for {}: price=${:.2}, limit=${:.2}, matches={}, already_matched={}", 
-                state.asset, down_price_f64, limit, price_matches, state.down_matched);
-            
+            log::debug!("Checking Down order for {}: price=${:.2}, limit=${:.2}, matches={}", 
+                state.asset, down_price_f64, limit, price_matches);
             if price_matches && !state.down_matched {
                 if self.config.strategy.simulation_mode {
                     log::info!("🎮 SIMULATION: Down order matched for {} (price hit ${:.2} <= ${:.2})", 

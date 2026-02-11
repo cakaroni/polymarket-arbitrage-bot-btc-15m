@@ -90,6 +90,8 @@ pub struct PreLimitOrderState {
     pub risk_sold: bool,
     pub order_placed_at: i64,
     pub market_period_start: i64,
+    /// Timestamp when we first had only one side matched (for sell_after_danger_time_passed)
+    pub one_side_matched_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

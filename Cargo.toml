@@ -21,7 +21,7 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.21"
-polymarket-clients-sdk = { version = "0.4.6", features = ["clob"] }
+polymarket-client-sdk = { version = "0.4.2", features = ["clob"] }
 alloy = { version = "1.3", features = ["full"] }
 alloy-contract = "1.3"
 alloy-sol-types = "1.5"

@@ -10,9 +10,9 @@ use log::{warn, error};
 use std::sync::Arc;
 
 // Official SDK imports for proper order signing
-use polymarket_clients_sdk::clob::{Client as ClobClient, Config as ClobConfig};
-use polymarket_clients_sdk::clob::types::{Side, OrderType, SignatureType};
-use polymarket_clients_sdk::POLYGON;
+use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
+use polymarket_client_sdk::clob::types::{Side, OrderType, OrderStatusType, SignatureType};
+use polymarket_client_sdk::POLYGON;
 use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer as _;
 use alloy::primitives::Address as AlloyAddress;
@@ -37,6 +37,18 @@ sol! {
 
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Polymarket Gamma API returns token IDs as decimal strings; CLOB SDK expects U256.
+fn parse_token_id_to_u256(s: &str) -> Result<U256> {
+    let s = s.trim();
+    if s.starts_with("0x") || s.starts_with("0X") {
+        U256::from_str_radix(s.trim_start_matches("0x").trim_start_matches("0X"), 16)
+            .context("Failed to parse token_id as hex")
+    } else {
+        U256::from_str_radix(s, 10)
+            .context("Failed to parse token_id as decimal")
+    }
+}
 
 pub struct PolymarketApi {
     client: Client,
@@ -388,7 +400,7 @@ impl PolymarketApi {
         eprintln!("📤 Creating and posting order: {} {} {} @ {}", 
               order.side, order.size, order.token_id, order.price);
 
-        let token_id_u256 = U256::from_str_radix(order.token_id.trim_start_matches("0x"), 16)
+        let token_id_u256 = parse_token_id_to_u256(&order.token_id)
             .context(format!("Failed to parse token_id as U256: {}", order.token_id))?;
 
         let order_builder = client
@@ -539,7 +551,7 @@ impl PolymarketApi {
         
         eprintln!("   Using current market price: ${:.4} for {} order", market_price, side);
 
-        let token_id_u256 = U256::from_str_radix(token_id.trim_start_matches("0x"), 16)
+        let token_id_u256 = parse_token_id_to_u256(token_id)
             .context(format!("Failed to parse token_id as U256: {}", token_id))?;
 
         let order_builder = client
@@ -697,6 +709,58 @@ impl PolymarketApi {
             .context(format!("Failed to cancel order {}", order_id))?;
         
         Ok(())
+    }
+
+    /// Check if both Up and Down orders are filled (production mode: verify via CLOB API).
+    /// Returns Ok((up_filled, down_filled)). Order not found or API error is treated as not filled.
+    pub async fn are_both_orders_filled(&self, up_order_id: &str, down_order_id: &str) -> Result<(bool, bool)> {
+        let _private_key = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Private key required to check order status"))?;
+
+        let signer = LocalSigner::from_str(_private_key)
+            .context("Failed to create signer from private key")?
+            .with_chain_id(Some(POLYGON));
+
+        let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
+            .context("Failed to create CLOB client")?
+            .authentication_builder(&signer);
+
+        if let Some(proxy_addr) = &self.proxy_wallet_address {
+            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
+                .context(format!("Failed to parse proxy_wallet_address: {}", proxy_addr))?;
+            auth_builder = auth_builder.funder(funder_address);
+            let sig_type = match self.signature_type {
+                Some(1) => SignatureType::Proxy,
+                Some(2) => SignatureType::GnosisSafe,
+                Some(0) | None => SignatureType::Proxy,
+                Some(n) => anyhow::bail!("Invalid signature_type: {}", n),
+            };
+            auth_builder = auth_builder.signature_type(sig_type);
+        } else if let Some(sig_type_num) = self.signature_type {
+            let sig_type = match sig_type_num {
+                0 => SignatureType::Eoa,
+                1 | 2 => anyhow::bail!("signature_type {} requires proxy_wallet_address", sig_type_num),
+                n => anyhow::bail!("Invalid signature_type: {}", n),
+            };
+            auth_builder = auth_builder.signature_type(sig_type);
+        }
+
+        let client = auth_builder
+            .authenticate()
+            .await
+            .context("Failed to authenticate with CLOB API")?;
+
+        let up_filled = client.order(up_order_id).await
+            .ok()
+            .map(|o| o.status == OrderStatusType::Matched)
+            .unwrap_or(false);
+
+        let down_filled = client.order(down_order_id).await
+            .ok()
+            .map(|o| o.status == OrderStatusType::Matched)
+            .unwrap_or(false);
+
+        Ok((up_filled, down_filled))
     }
     
     #[allow(dead_code)]
